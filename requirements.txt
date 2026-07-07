@@ -1,15 +1,9 @@
-# Production dependencies — pinned for container reproducibility.
-# Regenerate lock: pip freeze | grep -E '^(streamlit|supabase|...)'
-
-# Core application stack (explicit engineering pins)
-streamlit==1.50.0
-supabase==2.31.0
-google-genai==1.47.0
-langgraph==0.6.11
-sentence-transformers==5.1.2
-numpy==2.0.2
-
-# Runtime support (used across ingest, RAG, and dashboard)
-python-dotenv==1.2.1
-requests==2.32.5
-pandas==2.3.3
+streamlit
+supabase
+google-genai
+langgraph
+sentence-transformers
+numpy
+python-dotenv
+requests
+pandas
