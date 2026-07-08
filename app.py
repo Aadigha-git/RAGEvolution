@@ -86,6 +86,16 @@ def init_session_state() -> None:
         st.session_state.messages = []
     if "last_latency_seconds" not in st.session_state:
         st.session_state.last_latency_seconds = None
+    if "pending_query" not in st.session_state:
+        st.session_state.pending_query = None
+
+
+SUGGESTED_QUESTIONS = [
+    "What are the FDA-approved indications for semaglutide?",
+    "What pancreatitis warnings are listed for GLP-1 receptor agonists?",
+    "What drug interactions apply when liraglutide is taken with oral medications?",
+    "What boxed or serious warnings exist for tirzepatide?",
+]
 
 
 def _format_fsm_step(node_name: str, state: dict[str, Any]) -> str:
@@ -145,7 +155,11 @@ def run_agent_with_status(user_query: str) -> dict[str, Any]:
     }
 
 
-def render_retrieval_expander(sources: list[dict[str, Any]], title: str) -> None:
+def render_retrieval_expander(
+    sources: list[dict[str, Any]],
+    title: str,
+    key_prefix: str,
+) -> None:
     with st.expander(title, expanded=False):
         if not sources:
             st.info("No context blocks were retrieved for this response.")
@@ -175,6 +189,7 @@ def render_retrieval_expander(sources: list[dict[str, Any]], title: str) -> None
                 height=180,
                 disabled=True,
                 label_visibility="collapsed",
+                key=f"{key_prefix}_context_block_{idx}",
             )
             if idx < len(sources):
                 st.divider()
@@ -189,7 +204,7 @@ def render_fsm_trace(fsm_steps: list[str]) -> None:
             st.markdown(f"- {step}")
 
 
-def render_assistant_message(result: dict[str, Any]) -> None:
+def render_assistant_message(result: dict[str, Any], message_key: str) -> None:
     answer = result.get("answer") or result.get("response", "")
     metrics = result.get("metrics", {})
     sources = result.get("retrieved_sources") or result.get("context", [])
@@ -203,6 +218,7 @@ def render_assistant_message(result: dict[str, Any]) -> None:
     render_retrieval_expander(
         sources,
         title="🔍 Retrieved Context & Similarity Scores",
+        key_prefix=message_key,
     )
 
     pipeline = metrics.get("pipeline", "unknown")
@@ -217,59 +233,110 @@ def render_assistant_message(result: dict[str, Any]) -> None:
         st.caption(f"Pipeline: {pipeline}")
 
 
+def render_dataset_brief() -> None:
+    st.markdown(
+        """
+        <div style="border:1px solid #e2e8f0;border-radius:12px;padding:1.1rem 1.25rem;
+        background:#f8fafc;margin-bottom:1rem;">
+        <p style="font-size:1.05rem;font-weight:700;color:#1d4ed8;margin:0 0 0.5rem 0;">
+        About This Dataset</p>
+        <p style="font-size:0.95rem;line-height:1.65;color:#475569;margin:0;">
+        This lab queries <strong>GLP-1 and related metabolic drug labels</strong> sourced from the
+        public <strong>openFDA Drug Labeling API</strong>. The corpus covers prescription agents such as
+        semaglutide (Ozempic, Wegovy), liraglutide, tirzepatide (Mounjaro), dulaglutide (Trulicity),
+        and exenatide — with structured sections for indications, dosing, interactions, and warnings.
+        Answers are grounded in chunked FDA label text stored in Supabase
+        (<code>fda_document_chunks</code>), not general web knowledge.
+        </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_suggested_questions() -> None:
+    st.markdown("**Try asking:**")
+    cols = st.columns(2)
+    for idx, question in enumerate(SUGGESTED_QUESTIONS):
+        with cols[idx % 2]:
+            if st.button(question, key=f"suggest_q_{idx}", use_container_width=True):
+                st.session_state.pending_query = question
+                st.rerun()
+    st.caption(
+        "Tip: simple manufacturer or brand questions work well on v3.0 lookup paths; "
+        "safety and interaction questions stress-test retrieval and guardrails."
+    )
+    st.markdown("---")
+
+
+def process_user_query(prompt: str, architecture_version: str) -> None:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        try:
+            if architecture_version == V1_ARCHITECTURE:
+                with st.spinner("Running naive RAG pipeline…"):
+                    result = naive_rag_query(prompt)
+            elif architecture_version == V2_ARCHITECTURE:
+                with st.spinner("Running advanced RAG pipeline…"):
+                    result = advanced_rag_query(prompt)
+            elif architecture_version == V3_ARCHITECTURE:
+                result = run_agent_with_status(prompt)
+            else:
+                raise ValueError("Selected architecture is not supported for chat.")
+
+            render_assistant_message(
+                result,
+                message_key=f"live_{len(st.session_state.messages)}",
+            )
+
+            latency = result.get("metrics", {}).get("latency_seconds")
+            if isinstance(latency, (int, float)):
+                st.session_state.last_latency_seconds = latency
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": result.get("answer") or result.get("response", ""),
+                    "answer": result.get("answer") or result.get("response", ""),
+                    "retrieved_sources": result.get("retrieved_sources", []),
+                    "context": result.get("context", []),
+                    "intent": result.get("intent"),
+                    "safety_check_passed": result.get("safety_check_passed"),
+                    "fsm_steps": result.get("fsm_steps", []),
+                    "metrics": result.get("metrics", {}),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            error_text = f"Query failed: {exc}"
+            st.error(error_text)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": error_text, "answer": error_text}
+            )
+
+
 def render_rag_chat(architecture_version: str) -> None:
     init_session_state()
 
-    for message in st.session_state.messages:
+    render_dataset_brief()
+    render_suggested_questions()
+
+    for msg_index, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             if message["role"] == "user":
                 st.markdown(message["content"])
             else:
-                render_assistant_message(message)
+                render_assistant_message(message, message_key=f"history_{msg_index}")
+
+    if st.session_state.pending_query:
+        prompt = st.session_state.pending_query
+        st.session_state.pending_query = None
+        process_user_query(prompt, architecture_version)
 
     if prompt := st.chat_input("Ask about GLP-1 FDA label data…"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            try:
-                if architecture_version == V1_ARCHITECTURE:
-                    with st.spinner("Running naive RAG pipeline…"):
-                        result = naive_rag_query(prompt)
-                elif architecture_version == V2_ARCHITECTURE:
-                    with st.spinner("Running advanced RAG pipeline…"):
-                        result = advanced_rag_query(prompt)
-                elif architecture_version == V3_ARCHITECTURE:
-                    result = run_agent_with_status(prompt)
-                else:
-                    raise ValueError("Selected architecture is not supported for chat.")
-
-                render_assistant_message(result)
-
-                latency = result.get("metrics", {}).get("latency_seconds")
-                if isinstance(latency, (int, float)):
-                    st.session_state.last_latency_seconds = latency
-
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": result.get("answer") or result.get("response", ""),
-                        "answer": result.get("answer") or result.get("response", ""),
-                        "retrieved_sources": result.get("retrieved_sources", []),
-                        "context": result.get("context", []),
-                        "intent": result.get("intent"),
-                        "safety_check_passed": result.get("safety_check_passed"),
-                        "fsm_steps": result.get("fsm_steps", []),
-                        "metrics": result.get("metrics", {}),
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                error_text = f"Query failed: {exc}"
-                st.error(error_text)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_text, "answer": error_text}
-                )
+        process_user_query(prompt, architecture_version)
 
 
 def render_engineering_design_brief() -> None:
